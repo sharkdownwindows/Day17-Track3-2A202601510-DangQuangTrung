@@ -4,6 +4,7 @@ from typing import Any
 
 from .config import settings
 from .context_budget import ContextBudgetManager
+from .utils import cap_query, join_nonempty
 from .zep_common import prime_eval_thread, render_graph_search
 
 
@@ -18,35 +19,74 @@ class StudentMemory:
     # eval queries are longer than that, so wrap every query with
     # `cap_query(query)` (see src/utils.py) before passing it to graph.search.
 
+    # Episodes come back as whole chat messages. 240 characters keeps the
+    # longest seeded message (163 chars) intact together with any prefix Zep
+    # adds, so tail markers such as ASYNC-FIX-20 survive, while still leaving
+    # room for ~4 distinct episodes inside the 3% episodic budget.
+    EPISODE_CHAR_CAP = 240
+
     def retrieve_long_term(self, user_id: str, thread_id: str, query: str) -> str:
-        # LAB TODO 1/4
-        # 1) prime_eval_thread(...) has already been provided as scaffolding.
-        # 2) call thread.get_user_context(thread_id=...)
-        # 3) return the .context string.
-        # Bonus: append graph.search(scope="edges", limit>=20) facts with
-        #        validity ranges (a low limit can miss deadline/open-loop facts).
+        # The Context Block is scored against the *current* thread slice, so the
+        # query has to be in the thread before we ask for user context.
         prime_eval_thread(self.client, user_id, thread_id, query)
-        raise NotImplementedError("LAB TODO: implement long-term retrieval with Zep Context Block")
+        user_context = self.client.thread.get_user_context(thread_id=thread_id)
+        context_block = getattr(user_context, "context", "") or ""
+
+        # The context block alone can summarise away open loops and superseded
+        # preferences. Appending user-scoped edge facts (with their validity
+        # range) keeps the deadline/recency evidence and makes the conflict
+        # between the old and the new preference auditable in the report.
+        try:
+            facts = self.client.graph.search(
+                user_id=user_id,
+                query=cap_query(query),
+                scope="edges",
+                limit=20,
+            )
+            fact_text = render_graph_search(facts)
+        except Exception:
+            fact_text = ""
+
+        return join_nonempty([context_block, fact_text], sep="\n\n")
 
     def retrieve_episodic(self, user_id: str, query: str) -> str:
-        # LAB TODO 2/4
-        # Use client.graph.search(user_id=..., query=cap_query(query),
-        #     scope="episodes", limit=...) then render_graph_search(...).
-        # Tip: verbose session episodes can crowd out concise, marker-bearing
-        # reflections under the tight episodic budget — render_graph_search
-        # accepts an `episode_char_cap` to keep more distinct episodes.
-        raise NotImplementedError("LAB TODO: implement episodic search")
+        # User-scoped, never graph_id: episodes belong to one person and E09
+        # asserts that Lan's retrieval never leaks Minh's ORCHID-27.
+        results = self.client.graph.search(
+            user_id=user_id,
+            query=cap_query(query),
+            scope="episodes",
+            limit=15,
+        )
+        return render_graph_search(results, episode_char_cap=self.EPISODE_CHAR_CAP)
 
     def retrieve_semantic(self, graph_id: str, query: str) -> str:
-        # LAB TODO 3/4
-        # Search the standalone graph (graph_id, NOT user_id).
-        # Recommended: scope="episodes" — it returns raw document text that keeps
-        # literal markers (e.g. PAYMENT-RULE-3). The "auto" scope returns
-        # extracted facts that DROP those literal codes, so avoid it here.
-        # Fallback: scope="nodes".
-        raise NotImplementedError("LAB TODO: implement semantic graph search")
+        # Domain knowledge lives in the standalone graph, so search by graph_id.
+        # scope="episodes" returns the raw document text and therefore keeps the
+        # literal markers (PAYMENT-RULE-3, CONN-POOL-FIRST) that the scorer looks
+        # for; scope="auto" would return extracted facts that drop those codes.
+        capped = cap_query(query)
+        try:
+            results = self.client.graph.search(
+                graph_id=graph_id,
+                query=capped,
+                scope="episodes",
+                limit=8,
+            )
+        except Exception:
+            # Some accounts/SDK builds do not expose the episodes scope on a
+            # standalone graph; nodes still carry the marker in the summary.
+            results = self.client.graph.search(
+                graph_id=graph_id,
+                query=capped,
+                scope="nodes",
+                limit=8,
+            )
+        # No episode cap here: domain documents put their marker at the very end.
+        return render_graph_search(results)
 
     def assemble_context(self, layers: dict[str, str]) -> tuple[str, dict[str, dict[str, int]]]:
-        # LAB TODO 4/4
-        # Use ContextBudgetManager to enforce 10/4/3/3 budget and priority order.
-        raise NotImplementedError("LAB TODO: assemble/trim memory context")
+        # 10/4/3/3 of the context window, filled in priority order
+        # short_term -> long_term -> episodic -> semantic, trimming each layer
+        # from the tail because every renderer puts its best evidence first.
+        return self.budget.assemble(layers)

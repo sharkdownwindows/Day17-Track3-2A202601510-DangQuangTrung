@@ -84,31 +84,75 @@ def layer_badge(layer: str) -> str:
     return f'<span class="lab-badge" style="background:{color}">{layer}</span>'
 
 
+def case_messages(case: dict[str, Any]) -> list[dict[str, str]]:
+    """Seed turns for short-term memory: the fixture, else the session thread."""
+    fixture = case.get("fixture_messages")
+    if fixture:
+        return [{"role": m["role"], "content": m["content"]} for m in fixture]
+
+    for user in load_dataset()["users"]:
+        if user["user_id"] != case.get("user_id"):
+            continue
+        for session in user.get("sessions", []):
+            if session["thread_id"] == case.get("thread_id"):
+                return [{"role": m["role"], "content": m["content"]} for m in session["messages"]]
+    return []
+
+
+def seeded_thread_ids() -> set[str]:
+    return {s["thread_id"] for u in load_dataset()["users"] for s in u.get("sessions", [])}
+
+
+def priming_thread_id(case: dict[str, Any]) -> str:
+    """Pick a thread that long-term retrieval is allowed to prime.
+
+    `prime_eval_thread` deletes and recreates the thread before adding the
+    query, which is safe for the dedicated `eval-*` threads but would wipe a
+    seeded session thread (E01 points at `minh-s1`). Fall back to a scratch
+    thread whenever the case names a real session.
+    """
+    thread_id = case.get("thread_id") or ""
+    if thread_id and thread_id not in seeded_thread_ids():
+        return thread_id
+    return f"ui-{case['id']}"
+
+
+def wanted_layers(case: dict[str, Any]) -> set[str]:
+    expected = case.get("expected_layer", "mixed")
+    if expected == "mixed":
+        return set(case.get("retrieve_layers") or ["long_term", "semantic"])
+    if expected == "short_term":
+        return set()
+    return {expected}
+
+
 def retrieve_for_case(
     memory: StudentMemory,
     case: dict[str, Any],
     extra_messages: list[dict[str, str]],
 ) -> dict[str, Any]:
-    """BONUS TODO: run student retrieval for the loaded case.
+    """Run student retrieval for the loaded case and merge it under budget."""
+    layers = {"short_term": "", "long_term": "", "episodic": "", "semantic": ""}
 
-    Return a dict with keys:
-      - "merged_context": str  (StudentMemory.assemble_context output)
-      - "layers": dict[str, str]  (per-layer evidence: short_term/long_term/
-                                   episodic/semantic)
-      - "budget": dict  (the breakdown from assemble_context)
+    # Short-term is always local: same strategy/limits the evaluator uses.
+    stm = ShortTermMemory(strategy="sliding", max_recent_messages=6, pressure_tokens=450)
+    for msg in case_messages(case) + list(extra_messages or []):
+        stm.add(msg["role"], msg["content"])
+    layers["short_term"] = stm.render()
 
-    Hints:
-      * Build short_term from case["fixture_messages"] if present, else from
-        the matching user/thread messages in data/sessions.json, plus
-        extra_messages. E01 has no fixture — it uses thread minh-s1.
-      * Decide which durable layers to fetch from case["expected_layer"] (or
-        case["retrieve_layers"] for "mixed"), then call
-        memory.retrieve_long_term / retrieve_episodic / retrieve_semantic.
-      * Keep user_id and thread_id from the loaded case.
-      * Finish with memory.assemble_context(layers).
-    """
-    _ = (memory, case, extra_messages, settings, ShortTermMemory)
-    raise NotImplementedError("BONUS TODO: run student retrieval for the loaded case")
+    query = case.get("query", "")
+    user_id = case.get("user_id", "")
+    wanted = wanted_layers(case)
+
+    if "long_term" in wanted:
+        layers["long_term"] = memory.retrieve_long_term(user_id, priming_thread_id(case), query)
+    if "episodic" in wanted:
+        layers["episodic"] = memory.retrieve_episodic(user_id, query)
+    if "semantic" in wanted:
+        layers["semantic"] = memory.retrieve_semantic(settings.semantic_graph_id, query)
+
+    merged, budget = memory.assemble_context(layers)
+    return {"merged_context": merged, "layers": layers, "budget": budget}
 
 
 def main() -> None:

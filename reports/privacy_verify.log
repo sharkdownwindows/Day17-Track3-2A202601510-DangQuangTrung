@@ -1,0 +1,3 @@
+Zep user absent: True
+Redis user keys remaining: 0
+Shared semantic KB remains intact because it stores domain knowledge, not user PII.
